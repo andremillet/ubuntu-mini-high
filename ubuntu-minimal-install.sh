@@ -1,238 +1,174 @@
 #!/bin/bash
 
-# Script Name: ubuntu-minimal-install.sh
-# Description: Custom minimal Ubuntu installation with Openbox, disk encryption, NVIDIA support, and Steam compatibility
+# ubuntu-minimal-install.sh
+# Minimal Ubuntu installer with Openbox, LUKS encryption, Plank dock, and TUI
+# Hosted at: https://github.com/andremillet/ubuntu-mini-high/blob/main/ubuntu-minimal-install.sh
 
-# --- Configuration Variables ---
-TARGET_DISK=""
-HOSTNAME="minimal-ubuntu"
-USERNAME="user"
-ENCRYPTION_PASS=""
-INSTALL_NVIDIA=false
-LOG_FILE="/tmp/ubuntu-minimal-install.log"
+# Exit on error
+set -e
 
-# --- Error Handling ---
-set -e  # Exit on error
-exec 2>> "$LOG_FILE"  # Redirect errors to log file
-
+# Logging function
 log() {
-    echo "[$(date)] $1" | tee -a "$LOG_FILE"
+    echo "[INFO] $1" | tee -a /var/log/ubuntu-mini-high-install.log
 }
 
-error_exit() {
-    log "ERROR: $1"
+# Error handling function
+handle_error() {
+    echo "[ERROR] $1" >&2
+    echo "Installation failed. Check /var/log/ubuntu-mini-high-install.log for details." >&2
     exit 1
 }
 
-# --- Checkpoint for Rollback ---
-checkpoint() {
-    log "Checkpoint: $1"
-    echo "$1" > /tmp/install-checkpoint
-}
+# Check for root privileges
+if [ "$EUID" -ne 0 ]; then
+    handle_error "This script must be run as root."
+fi
 
-rollback() {
-    log "Rolling back from checkpoint: $(cat /tmp/install-checkpoint)"
-    # Add rollback logic here (e.g., unmount partitions, remove files)
-    exit 1
-}
+# Install dialog for TUI
+apt-get update || handle_error "Failed to update package lists."
+apt-get install -y dialog || handle_error "Failed to install dialog."
 
-trap rollback ERR  # Trigger rollback on error
+# TUI: Welcome message
+dialog --title "Ubuntu Mini High Installer" --msgbox "Welcome to the Ubuntu Mini High installation!\nThis will set up a minimal Ubuntu system with Openbox, LUKS encryption, and a macOS Mojave-themed Plank dock." 10 60
 
-# --- TUI Functions ---
-select_disk() {
-    DISKS=$(lsblk -d -n -o NAME | grep -v loop)
-    TARGET_DISK=$(whiptail --title "Select Disk" --menu "Choose the disk to install Ubuntu on:" 15 60 5 \
-        $(for disk in $DISKS; do echo "/dev/$disk $disk"; done) 3>&1 1>&2 2>&3) || error_exit "Disk selection cancelled"
-    log "Selected disk: $TARGET_DISK"
-}
+# TUI: Select disk
+DISKS=$(lsblk -d -o NAME,SIZE | grep -v loop | awk '{print $1 " (" $2 ")"}')
+DISK=$(dialog --title "Select Installation Disk" --menu "Choose the disk to install Ubuntu Mini High:" 15 60 5 $DISKS 2>&1 >/dev/tty) || handle_error "Disk selection canceled."
+DISK="/dev/$DISK"
+log "Selected disk: $DISK"
 
-set_hostname() {
-    HOSTNAME=$(whiptail --title "Set Hostname" --inputbox "Enter the hostname for your system:" 10 60 "$HOSTNAME" 3>&1 1>&2 2>&3) || error_exit "Hostname setup cancelled"
-    log "Hostname set to: $HOSTNAME"
-}
+# TUI: Confirm disk wipe
+dialog --title "Confirm Disk Wipe" --yesno "WARNING: All data on $DISK will be erased. Continue?" 7 60 || handle_error "User canceled disk wipe."
+log "User confirmed disk wipe."
 
-set_username() {
-    USERNAME=$(whiptail --title "Set Username" --inputbox "Enter the username for your account:" 10 60 "$USERNAME" 3>&1 1>&2 2>&3) || error_exit "Username setup cancelled"
-    log "Username set to: $USERNAME"
-}
+# TUI: Set hostname
+HOSTNAME=$(dialog --title "Set Hostname" --inputbox "Enter hostname for the system:" 8 40 "ubuntu-mini-high" 2>&1 >/dev/tty) || handle_error "Hostname input canceled."
+log "Hostname set to: $HOSTNAME"
 
-set_encryption_pass() {
-    ENCRYPTION_PASS=$(whiptail --title "Set Encryption Password" --passwordbox "Enter the password for disk encryption:" 10 60 3>&1 1>&2 2>&3) || error_exit "Encryption password setup cancelled"
-    log "Encryption password set"
-}
+# TUI: Set username
+USERNAME=$(dialog --title "Set Username" --inputbox "Enter username for the primary user:" 8 40 "user" 2>&1 >/dev/tty) || handle_error "Username input canceled."
+log "Username set to: $USERNAME"
 
-nvidia_option() {
-    if whiptail --title "NVIDIA Support" --yesno "Do you want to install NVIDIA drivers?" 10 60; then
-        INSTALL_NVIDIA=true
-        log "NVIDIA driver installation enabled"
-    else
-        INSTALL_NVIDIA=false
-        log "NVIDIA driver installation disabled"
-    fi
-}
+# TUI: Set user password
+PASSWORD=$(dialog --title "Set Password" --passwordbox "Enter password for $USERNAME:" 8 40 2>&1 >/dev/tty) || handle_error "Password input canceled."
+PASSWORD2=$(dialog --title "Confirm Password" --passwordbox "Confirm password for $USERNAME:" 8 40 2>&1 >/dev/tty) || handle_error "Password confirmation canceled."
+if [ "$PASSWORD" != "$PASSWORD2" ]; then
+    handle_error "Passwords do not match."
+fi
+log "User password set."
 
-# --- Partitioning and Encryption ---
-partition_disk() {
-    log "Partitioning disk: $TARGET_DISK"
-    checkpoint "Partitioning"
+# TUI: Prompt for Steam installation
+dialog --title "Install Steam" --yesno "Would you like to install Steam for gaming?" 7 60
+STEAM_INSTALL=$?
+log "Steam installation selection: $STEAM_INSTALL"
 
-    # Create partitions: 1 for boot (unencrypted), 2 for root (encrypted), 3 for home (encrypted)
-    parted -s "$TARGET_DISK" mklabel gpt
-    parted -s "$TARGET_DISK" mkpart primary 1MiB 512MiB  # Boot
-    parted -s "$TARGET_DISK" mkpart primary 512MiB 50GiB  # Root
-    parted -s "$TARGET_DISK" mkpart primary 50GiB 100%    # Home
-    parted -s "$TARGET_DISK" set 1 boot on
+# Partition the disk: /boot, /, /home
+log "Partitioning disk $DISK..."
+parted -s "$DISK" mklabel gpt || handle_error "Failed to create GPT label."
+parted -s "$DISK" mkpart primary fat32 1MiB 512MiB || handle_error "Failed to create /boot partition."
+parted -s "$DISK" set 1 esp on || handle_error "Failed to set ESP flag."
+parted -s "$DISK" mkpart primary ext4 512MiB 20GiB || handle_error "Failed to create / partition."
+parted -s "$DISK" mkpart primary ext4 20GiB 100% || handle_error "Failed to create /home partition."
+log "Disk partitioned successfully."
 
-    # Format boot partition
-    mkfs.ext4 "${TARGET_DISK}p1"
+# Set up LUKS encryption for / and /home
+log "Setting up LUKS encryption..."
+cryptsetup luksFormat "${DISK}p2" || handle_error "Failed to format LUKS for /."
+cryptsetup luksFormat "${DISK}p3" || handle_error "Failed to format LUKS for /home."
+cryptsetup luksOpen "${DISK}p2" cryptroot || handle_error "Failed to open LUKS for /."
+cryptsetup luksOpen "${DISK}p3" crypthome || handle_error "Failed to open LUKS for /home."
+log "LUKS encryption set up."
 
-    # Encrypt root partition
-    echo -n "$ENCRYPTION_PASS" | cryptsetup luksFormat "${TARGET_DISK}p2" -
-    echo -n "$ENCRYPTION_PASS" | cryptsetup luksOpen "${TARGET_DISK}p2" cryptroot -
-    mkfs.ext4 /dev/mapper/cryptroot
+# Format partitions
+mkfs.vfat -F32 "${DISK}p1" || handle_error "Failed to format /boot."
+mkfs.ext4 /dev/mapper/cryptroot || handle_error "Failed to format /."
+mkfs.ext4 /dev/mapper/crypthome || handle_error "Failed to format /home."
+log "Partitions formatted."
 
-    # Encrypt home partition
-    echo -n "$ENCRYPTION_PASS" | cryptsetup luksFormat "${TARGET_DISK}p3" -
-    echo -n "$ENCRYPTION_PASS" | cryptsetup luksOpen "${TARGET_DISK}p3" crypthome -
-    mkfs.ext4 /dev/mapper/crypthome
+# Mount partitions
+mount /dev/mapper/cryptroot /mnt || handle_error "Failed to mount /."
+mkdir -p /mnt/boot /mnt/home
+mount "${DISK}p1" /mnt/boot || handle_error "Failed to mount /boot."
+mount /dev/mapper/crypthome /mnt/home || handle_error "Failed to mount /home."
+log "Partitions mounted."
 
-    log "Disk partitioning and encryption completed"
-}
+# Install base system
+log "Installing base system..."
+debootstrap noble /mnt http://archive.ubuntu.com/ubuntu/ || handle_error "Debootstrap failed."
+log "Base system installed."
 
-# --- Mount Partitions ---
-mount_partitions() {
-    log "Mounting partitions"
-    checkpoint "Mounting"
+# Configure fstab
+log "Configuring fstab..."
+echo "UUID=$(blkid -s UUID -o value ${DISK}p1) /boot vfat defaults 0 2" >> /mnt/etc/fstab
+echo "/dev/mapper/cryptroot / ext4 defaults 0 1" >> /mnt/etc/fstab
+echo "/dev/mapper/crypthome /home ext4 defaults 0 2" >> /mnt/etc/fstab
+log "fstab configured."
 
-    mount /dev/mapper/cryptroot /mnt
-    mkdir /mnt/boot
-    mount "${TARGET_DISK}p1" /mnt/boot
-    mkdir /mnt/home
-    mount /dev/mapper/crypthome /mnt/home
+# Chroot into the new system
+log "Chrooting into new system..."
+mount --bind /dev /mnt/dev
+mount --bind /proc /mnt/proc
+mount --bind /sys /mnt/sys
+chroot /mnt /bin/bash << 'EOF'
+set -e
 
-    log "Partitions mounted"
-}
+# Set hostname
+echo "$HOSTNAME" > /etc/hostname
+echo "127.0.0.1 localhost $HOSTNAME" >> /etc/hosts
 
-# --- Install Base System ---
-install_base_system() {
-    log "Installing base system"
-    checkpoint "Base System Installation"
+# Update package lists
+apt-get update
 
-    # Use debootstrap to install a minimal Ubuntu system
-    debootstrap noble /mnt http://archive.ubuntu.com/ubuntu/ || error_exit "Failed to install base system"
+# Install essential packages
+apt-get install -y linux-generic openbox plank nvidia-driver-550 network-manager cryptsetup grub-efi-amd64 || exit 1
 
-    # Mount necessary filesystems
-    for dir in dev proc sys; do
-        mount --bind "/$dir" "/mnt/$dir"
-    done
+# Install Steam if selected
+if [ "$STEAM_INSTALL" -eq 0 ]; then
+    apt-get install -y steam
+fi
 
-    log "Base system installed"
-}
+# Set up user
+useradd -m -s /bin/bash "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
 
-# --- Configure System ---
-configure_system() {
-    log "Configuring system"
-    checkpoint "System Configuration"
+# Configure Openbox
+mkdir -p /home/$USERNAME/.config/openbox
+cp /usr/share/openbox/menu.xml /home/$USERNAME/.config/openbox/
+echo "exec openbox-session" > /home/$USERNAME/.xinitrc
+chown -R $USERNAME:$USERNAME /home/$USERNAME/.config /home/$USERNAME/.xinitrc
 
-    # Set hostname
-    echo "$HOSTNAME" > /mnt/etc/hostname
-    echo "127.0.0.1 localhost $HOSTNAME" > /mnt/etc/hosts
+# Install and configure Plank with macOS Mojave theme
+apt-get install -y wget unzip
+wget https://www.gnome-look.org/p/1248226 -O /tmp/mojave-theme.zip
+unzip /tmp/mojave-theme.zip -d /usr/share/plank/themes/
+echo "[Plank]\ntheme=Mojave" > /home/$USERNAME/.config/plank/plank.ini
+chown $USERNAME:$USERNAME /home/$USERNAME/.config/plank
 
-    # Configure fstab
-    echo "UUID=$(blkid -s UUID -o value ${TARGET_DISK}p1) /boot ext4 defaults 0 2" >> /mnt/etc/fstab
-    echo "/dev/mapper/cryptroot / ext4 defaults 0 1" >> /mnt/etc/fstab
-    echo "/dev/mapper/crypthome /home ext4 defaults 0 2" >> /mnt/etc/fstab
+# Configure autologin
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat << 'AUTOLOGIN' > /etc/systemd/system/getty@tty1.service.d/override.conf
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $USERNAME --noclear %I $TERM
+AUTOLOGIN
+systemctl enable getty@tty1.service
 
-    # Configure crypttab
-    echo "cryptroot ${TARGET_DISK}p2 none luks" >> /mnt/etc/crypttab
-    echo "crypthome ${TARGET_DISK}p3 none luks" >> /mnt/etc/crypttab
+# Install GRUB
+grub-install --target=x86_64-efi --efi-directory=/boot
+update-grub
 
-    # Chroot and configure
-    chroot /mnt /bin/bash -c "
-        apt update
-        apt install -y linux-image-generic grub-efi
-        grub-install $TARGET_DISK
-        update-grub
+# Configure crypttab
+echo "cryptroot UUID=$(blkid -s UUID -o value ${DISK}p2) none luks" >> /etc/crypttab
+echo "crypthome UUID=$(blkid -s UUID -o value ${DISK}p3) none luks" >> /etc/crypttab
 
-        # Install Openbox and minimal X server
-        apt install -y openbox xorg xinit
+exit
+EOF
+log "Chroot configuration completed."
 
-        # Install network manager
-        apt install -y network-manager
+# Unmount everything
+umount /mnt/dev /mnt/proc /mnt/sys /mnt/boot /mnt/home /mnt
+cryptsetup luksClose cryptroot
+cryptsetup luksClose crypthome
+log "Installation completed successfully."
 
-        # Set up user
-        useradd -m -s /bin/bash $USERNAME
-        echo '$USERNAME:$ENCRYPTION_PASS' | chpasswd
-        usermod -aG sudo $USERNAME
-    "
-
-    log "System configuration completed"
-}
-
-# --- Install NVIDIA Drivers (if selected) ---
-install_nvidia() {
-    if [ "$INSTALL_NVIDIA" = true ]; then
-        log "Installing NVIDIA drivers"
-        checkpoint "NVIDIA Installation"
-
-        chroot /mnt /bin/bash -c "
-            apt install -y nvidia-driver nvidia-utils
-        "
-
-        log "NVIDIA drivers installed"
-    fi
-}
-
-# --- Install Steam ---
-install_steam() {
-    log "Installing Steam"
-    checkpoint "Steam Installation"
-
-    chroot /mnt /bin/bash -c "
-        apt install -y steam
-    "
-
-    log "Steam installed"
-}
-
-# --- Install Dock (Plank) ---
-install_dock() {
-    log "Installing dock (Plank)"
-    checkpoint "Dock Installation"
-
-    chroot /mnt /bin/bash -c "
-        apt install -y plank
-        # Configure Plank to autostart with Openbox
-        mkdir -p /home/$USERNAME/.config/openbox
-        echo 'plank &' >> /home/$USERNAME/.config/openbox/autostart
-        chown -R $USERNAME:$USERNAME /home/$USERNAME/.config
-    "
-
-    log "Dock installed"
-}
-
-# --- Main Installation Process ---
-main() {
-    log "Starting installation process"
-
-    # TUI Steps
-    select_disk
-    set_hostname
-    set_username
-    set_encryption_pass
-    nvidia_option
-
-    # Installation Steps
-    partition_disk
-    mount_partitions
-    install_base_system
-    configure_system
-    install_nvidia
-    install_steam
-    install_dock
-
-    log "Installation completed successfully"
-    whiptail --title "Installation Complete" --msgbox "Ubuntu installation completed! Reboot to start using your system." 10 60
-}
-
-main
+dialog --title "Installation Complete" --msgbox "Ubuntu Mini High has been installed! Reboot to start using your system." 7 60

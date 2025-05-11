@@ -1,174 +1,177 @@
 #!/bin/bash
 
 # ubuntu-minimal-install.sh
-# Minimal Ubuntu installer with Openbox, LUKS encryption, Plank dock, and TUI
-# Hosted at: https://github.com/andremillet/ubuntu-mini-high/blob/main/ubuntu-minimal-install.sh
+# Ubuntu-mini-high installer for a minimal Ubuntu with Openbox, LUKS encryption, and macOS Mojave theme
 
 # Exit on error
 set -e
 
-# Logging function
-log() {
-    echo "[INFO] $1" | tee -a /var/log/ubuntu-mini-high-install.log
-}
+# Logging setup
+LOG_FILE="/var/log/ubuntu-mini-high-install.log"
+exec 1>>"$LOG_FILE" 2>&1
+echo "Starting ubuntu-mini-high installation at $(date)"
 
-# Error handling function
-handle_error() {
-    echo "[ERROR] $1" >&2
-    echo "Installation failed. Check /var/log/ubuntu-mini-high-install.log for details." >&2
-    exit 1
-}
-
-# Check for root privileges
+# Check if running as root
 if [ "$EUID" -ne 0 ]; then
-    handle_error "This script must be run as root."
+  echo "Please run as root"
+  exit 1
 fi
 
-# Install dialog for TUI
-apt-get update || handle_error "Failed to update package lists."
-apt-get install -y dialog || handle_error "Failed to install dialog."
+# Check for live environment (Desktop ISO uses /cdrom/casper)
+if [ -d /cdrom/casper ]; then
+  echo "Detected live environment, adjusting for compatibility..."
+  # Ensure writable /tmp
+  mount -o remount,rw /tmp 2>/dev/null || true
+  # Unmount any conflicting mounts
+  umount /mnt/* 2>/dev/null || true
+fi
 
-# TUI: Welcome message
-dialog --title "Ubuntu Mini High Installer" --msgbox "Welcome to the Ubuntu Mini High installation!\nThis will set up a minimal Ubuntu system with Openbox, LUKS encryption, and a macOS Mojave-themed Plank dock." 10 60
+# Verify required tools are installed
+for cmd in dialog debootstrap parted cryptsetup; do
+  if ! command -v $cmd >/dev/null; then
+    echo "Error: $cmd is not installed. Please install it and try again."
+    exit 1
+  fi
+done
+
+# Default variables
+DISK=""
+ENCRYPT_HOME="no"
+STEAM_INSTALL="no"
+
+# TUI: Welcome screen
+dialog --title "Ubuntu-mini-high Installer" --msgbox "Welcome to the ubuntu-mini-high installer!\nThis will set up a minimal Ubuntu with Openbox, LUKS encryption, and a macOS Mojave-like theme." 10 60
 
 # TUI: Select disk
-DISKS=$(lsblk -d -o NAME,SIZE | grep -v loop | awk '{print $1 " (" $2 ")"}')
-DISK=$(dialog --title "Select Installation Disk" --menu "Choose the disk to install Ubuntu Mini High:" 15 60 5 $DISKS 2>&1 >/dev/tty) || handle_error "Disk selection canceled."
-DISK="/dev/$DISK"
-log "Selected disk: $DISK"
-
-# TUI: Confirm disk wipe
-dialog --title "Confirm Disk Wipe" --yesno "WARNING: All data on $DISK will be erased. Continue?" 7 60 || handle_error "User canceled disk wipe."
-log "User confirmed disk wipe."
-
-# TUI: Set hostname
-HOSTNAME=$(dialog --title "Set Hostname" --inputbox "Enter hostname for the system:" 8 40 "ubuntu-mini-high" 2>&1 >/dev/tty) || handle_error "Hostname input canceled."
-log "Hostname set to: $HOSTNAME"
-
-# TUI: Set username
-USERNAME=$(dialog --title "Set Username" --inputbox "Enter username for the primary user:" 8 40 "user" 2>&1 >/dev/tty) || handle_error "Username input canceled."
-log "Username set to: $USERNAME"
-
-# TUI: Set user password
-PASSWORD=$(dialog --title "Set Password" --passwordbox "Enter password for $USERNAME:" 8 40 2>&1 >/dev/tty) || handle_error "Password input canceled."
-PASSWORD2=$(dialog --title "Confirm Password" --passwordbox "Confirm password for $USERNAME:" 8 40 2>&1 >/dev/tty) || handle_error "Password confirmation canceled."
-if [ "$PASSWORD" != "$PASSWORD2" ]; then
-    handle_error "Passwords do not match."
+DISKS=$(lsblk -d -n -o NAME | grep -E '^sd|^nvme')
+DISK=$(dialog --title "Select Disk" --menu "Choose the disk to install Ubuntu on (WARNING: This will erase the disk!)" 15 60 5 \
+  $DISKS 2>&1 >/dev/tty)
+if [ -z "$DISK" ]; then
+  dialog --msgbox "No disk selected. Exiting." 6 40
+  exit 1
 fi
-log "User password set."
+DISK="/dev/$DISK"
 
-# TUI: Prompt for Steam installation
-dialog --title "Install Steam" --yesno "Would you like to install Steam for gaming?" 7 60
-STEAM_INSTALL=$?
-log "Steam installation selection: $STEAM_INSTALL"
+# TUI: Encrypt /home partition?
+ENCRYPT_HOME=$(dialog --title "Encrypt /home" --yesno "Do you want to encrypt the /home partition separately?" 7 50 && echo "yes" || echo "no")
 
-# Partition the disk: /boot, /, /home
-log "Partitioning disk $DISK..."
-parted -s "$DISK" mklabel gpt || handle_error "Failed to create GPT label."
-parted -s "$DISK" mkpart primary fat32 1MiB 512MiB || handle_error "Failed to create /boot partition."
-parted -s "$DISK" set 1 esp on || handle_error "Failed to set ESP flag."
-parted -s "$DISK" mkpart primary ext4 512MiB 20GiB || handle_error "Failed to create / partition."
-parted -s "$DISK" mkpart primary ext4 20GiB 100% || handle_error "Failed to create /home partition."
-log "Disk partitioned successfully."
+# TUI: Install Steam?
+STEAM_INSTALL=$(dialog --title "Install Steam" --yesno "Do you want to install Steam?" 7 50 && echo "yes" || echo "no")
 
-# Set up LUKS encryption for / and /home
-log "Setting up LUKS encryption..."
-cryptsetup luksFormat "${DISK}p2" || handle_error "Failed to format LUKS for /."
-cryptsetup luksFormat "${DISK}p3" || handle_error "Failed to format LUKS for /home."
-cryptsetup luksOpen "${DISK}p2" cryptroot || handle_error "Failed to open LUKS for /."
-cryptsetup luksOpen "${DISK}p3" crypthome || handle_error "Failed to open LUKS for /home."
-log "LUKS encryption set up."
+# Confirm settings
+dialog --title "Confirm Settings" --yesno "Disk: $DISK\nEncrypt /home: $ENCRYPT_HOME\nInstall Steam: $STEAM_INSTALL\n\nProceed with installation?" 10 60
+if [ $? -ne 0 ]; then
+  dialog --msgbox "Installation cancelled." 6 40
+  exit 1
+fi
 
-# Format partitions
-mkfs.vfat -F32 "${DISK}p1" || handle_error "Failed to format /boot."
-mkfs.ext4 /dev/mapper/cryptroot || handle_error "Failed to format /."
-mkfs.ext4 /dev/mapper/crypthome || handle_error "Failed to format /home."
-log "Partitions formatted."
+# Backup partition table (error recovery)
+sfdisk --dump "$DISK" > /tmp/partition_table_backup
+echo "Partition table backed up to /tmp/partition_table_backup"
+
+# Partition the disk: 512MB /boot, 20GB /, remainder /home
+parted -s "$DISK" mklabel gpt
+parted -s "$DISK" mkpart primary fat32 1MiB 513MiB
+parted -s "$DISK" set 1 esp on
+parted -s "$DISK" mkpart primary ext4 513MiB 20513MiB
+parted -s "$DISK" mkpart primary ext4 20513MiB 100%
+partprobe "$DISK"
+
+# Setup LUKS encryption for root
+cryptsetup luksFormat "${DISK}p2"
+cryptsetup open "${DISK}p2" cryptroot
+mkfs.ext4 /dev/mapper/cryptroot
+
+# Setup /home partition (encrypted or not)
+if [ "$ENCRYPT_HOME" = "yes" ]; then
+  cryptsetup luksFormat "${DISK}p3"
+  cryptsetup open "${DISK}p3" crypthome
+  mkfs.ext4 /dev/mapper/crypthome
+else
+  mkfs.ext4 "${DISK}p3"
+fi
+
+# Format /boot
+mkfs.vfat "${DISK}p1"
 
 # Mount partitions
-mount /dev/mapper/cryptroot /mnt || handle_error "Failed to mount /."
+mount /dev/mapper/cryptroot /mnt
 mkdir -p /mnt/boot /mnt/home
-mount "${DISK}p1" /mnt/boot || handle_error "Failed to mount /boot."
-mount /dev/mapper/crypthome /mnt/home || handle_error "Failed to mount /home."
-log "Partitions mounted."
+mount "${DISK}p1" /mnt/boot
+if [ "$ENCRYPT_HOME" = "yes" ]; then
+  mount /dev/mapper/crypthome /mnt/home
+else
+  mount "${DISK}p3" /mnt/home
+fi
 
-# Install base system
-log "Installing base system..."
-debootstrap noble /mnt http://archive.ubuntu.com/ubuntu/ || handle_error "Debootstrap failed."
-log "Base system installed."
+# Install minimal Ubuntu (Noble)
+apt-get update
+apt-get install -y debootstrap
+debootstrap noble /mnt http://archive.ubuntu.com/ubuntu/
+echo "Minimal Ubuntu base installed"
 
 # Configure fstab
-log "Configuring fstab..."
-echo "UUID=$(blkid -s UUID -o value ${DISK}p1) /boot vfat defaults 0 2" >> /mnt/etc/fstab
-echo "/dev/mapper/cryptroot / ext4 defaults 0 1" >> /mnt/etc/fstab
-echo "/dev/mapper/crypthome /home ext4 defaults 0 2" >> /mnt/etc/fstab
-log "fstab configured."
+UUID_BOOT=$(blkid -s UUID -o value "${DISK}p1")
+UUID_ROOT=$(blkid -s UUID -o value "${DISK}p2")
+UUID_HOME=$(blkid -s UUID -o value "${DISK}p3")
+cat << EOF > /mnt/etc/fstab
+UUID=$UUID_BOOT /boot vfat defaults 0 2
+/dev/mapper/cryptroot / ext4 defaults 0 1
+/dev/mapper/crypthome /home ext4 defaults 0 2
+EOF
 
-# Chroot into the new system
-log "Chrooting into new system..."
+# Chroot setup
 mount --bind /dev /mnt/dev
 mount --bind /proc /mnt/proc
 mount --bind /sys /mnt/sys
-chroot /mnt /bin/bash << 'EOF'
-set -e
+cp /etc/resolv.conf /mnt/etc/resolv.conf
 
-# Set hostname
-echo "$HOSTNAME" > /etc/hostname
-echo "127.0.0.1 localhost $HOSTNAME" >> /etc/hosts
+# Install kernel, GRUB, and essential packages
+chroot /mnt apt-get update
+chroot /mnt apt-get install -y linux-generic grub-efi-amd64 openbox obconf plank tint2 nitrogen
+chroot /mnt grub-install "$DISK"
+chroot /mnt update-grub
 
-# Update package lists
-apt-get update
-
-# Install essential packages
-apt-get install -y linux-generic openbox plank nvidia-driver-550 network-manager cryptsetup grub-efi-amd64 || exit 1
-
-# Install Steam if selected
-if [ "$STEAM_INSTALL" -eq 0 ]; then
-    apt-get install -y steam
+# Install NVIDIA drivers if detected
+if lspci | grep -i nvidia >/dev/null; then
+  chroot /mnt apt-get install -y nvidia-driver-550
+  echo "NVIDIA drivers installed"
 fi
 
-# Set up user
-useradd -m -s /bin/bash "$USERNAME"
-echo "$USERNAME:$PASSWORD" | chpasswd
+# Install Steam if selected
+if [ "$STEAM_INSTALL" = "yes" ]; then
+  chroot /mnt apt-get install -y steam
+  echo "Steam installed"
+fi
 
-# Configure Openbox
-mkdir -p /home/$USERNAME/.config/openbox
-cp /usr/share/openbox/menu.xml /home/$USERNAME/.config/openbox/
-echo "exec openbox-session" > /home/$USERNAME/.xinitrc
-chown -R $USERNAME:$USERNAME /home/$USERNAME/.config /home/$USERNAME/.xinitrc
+# Install McMojave theme and Plank dock theme
+chroot /mnt apt-get install -y git
+chroot /mnt git clone https://github.com/vinceliuice/Mojave-gtk-theme.git /tmp/Mojave-gtk-theme
+chroot /mnt /tmp/Mojave-gtk-theme/install.sh
+chroot /mnt git clone https://github.com/paulxfce/mcOS-Mojave-for-Plank-Dock.git /tmp/mcOS-Mojave-Plank
+chroot /mnt cp -r /tmp/mcOS-Mojave-Plank/McOS-Mojave /usr/share/plank/themes/
 
-# Install and configure Plank with macOS Mojave theme
-apt-get install -y wget unzip
-wget https://www.gnome-look.org/p/1248226 -O /tmp/mojave-theme.zip
-unzip /tmp/mojave-theme.zip -d /usr/share/plank/themes/
-echo "[Plank]\ntheme=Mojave" > /home/$USERNAME/.config/plank/plank.ini
-chown $USERNAME:$USERNAME /home/$USERNAME/.config/plank
-
-# Configure autologin
-mkdir -p /etc/systemd/system/getty@tty1.service.d
-cat << 'AUTOLOGIN' > /etc/systemd/system/getty@tty1.service.d/override.conf
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin $USERNAME --noclear %I $TERM
-AUTOLOGIN
-systemctl enable getty@tty1.service
-
-# Install GRUB
-grub-install --target=x86_64-efi --efi-directory=/boot
-update-grub
-
-# Configure crypttab
-echo "cryptroot UUID=$(blkid -s UUID -o value ${DISK}p2) none luks" >> /etc/crypttab
-echo "crypthome UUID=$(blkid -s UUID -o value ${DISK}p3) none luks" >> /etc/crypttab
-
-exit
+# Configure Openbox autostart
+mkdir -p /mnt/etc/xdg/openbox
+cat << EOF > /mnt/etc/xdg/openbox/autostart
+tint2 &
+plank &
+nitrogen --restore &
 EOF
-log "Chroot configuration completed."
 
-# Unmount everything
+# Set up user
+chroot /mnt useradd -m -s /bin/bash user
+chroot /mnt passwd user
+
+# Clean up
 umount /mnt/dev /mnt/proc /mnt/sys /mnt/boot /mnt/home /mnt
-cryptsetup luksClose cryptroot
-cryptsetup luksClose crypthome
-log "Installation completed successfully."
+if [ "$ENCRYPT_HOME" = "yes" ]; then
+  cryptsetup close crypthome
+fi
+cryptsetup close cryptroot
 
-dialog --title "Installation Complete" --msgbox "Ubuntu Mini High has been installed! Reboot to start using your system." 7 60
+# Finalize
+dialog --title "Installation Complete" --msgbox "Ubuntu-mini-high installation complete! Reboot to start using your system." 6 60
+echo "Installation completed successfully at $(date)" >> "$LOG_FILE"
+
+exit 0
